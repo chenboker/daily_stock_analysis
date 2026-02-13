@@ -14,17 +14,20 @@ A股自选股智能分析系统 - 通知层
    - 邮件 SMTP
    - Pushover（手机/桌面推送）
 """
-
+import hashlib
+import hmac
 import logging
 import json
 import smtplib
 import re
+import time
 import markdown2
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
+from email.utils import formataddr
 from enum import Enum
 
 import requests
@@ -36,6 +39,7 @@ except ImportError:
 
 from src.config import get_config
 from src.analyzer import AnalysisResult
+from src.formatters import format_feishu_markdown
 from bot.models import BotMessage
 
 logger = logging.getLogger(__name__)
@@ -49,8 +53,10 @@ class NotificationChannel(Enum):
     EMAIL = "email"        # 邮件
     PUSHOVER = "pushover"  # Pushover（手机/桌面推送）
     PUSHPLUS = "pushplus"  # PushPlus（国内推送服务）
+    SERVERCHAN3 = "serverchan3"  # Server酱3（手机APP推送服务）
     CUSTOM = "custom"      # 自定义 Webhook
     DISCORD = "discord"    # Discord 机器人 (Bot)
+    ASTRBOT = "astrbot"
     UNKNOWN = "unknown"    # 未知
 
 
@@ -96,8 +102,10 @@ class ChannelDetector:
             NotificationChannel.EMAIL: "邮件",
             NotificationChannel.PUSHOVER: "Pushover",
             NotificationChannel.PUSHPLUS: "PushPlus",
+            NotificationChannel.SERVERCHAN3: "Server酱3",
             NotificationChannel.CUSTOM: "自定义Webhook",
             NotificationChannel.DISCORD: "Discord机器人",
+            NotificationChannel.ASTRBOT: "ASTRBOT机器人",
             NotificationChannel.UNKNOWN: "未知渠道",
         }
         return names.get(channel, "未知渠道")
@@ -135,20 +143,26 @@ class NotificationService:
         # 各渠道的 Webhook URL
         self._wechat_url = config.wechat_webhook_url
         self._feishu_url = getattr(config, 'feishu_webhook_url', None)
-        
+
+        # 微信消息类型配置
+        self._wechat_msg_type = getattr(config, 'wechat_msg_type', 'markdown')
         # Telegram 配置
         self._telegram_config = {
             'bot_token': getattr(config, 'telegram_bot_token', None),
             'chat_id': getattr(config, 'telegram_chat_id', None),
+            'message_thread_id': getattr(config, 'telegram_message_thread_id', None),
         }
         
         # 邮件配置
         self._email_config = {
             'sender': config.email_sender,
+            'sender_name': getattr(config, 'email_sender_name', 'daily_stock_analysis股票分析助手'),
             'password': config.email_password,
             'receivers': config.email_receivers or ([config.email_sender] if config.email_sender else []),
         }
-        
+        # Stock-to-email group routing (Issue #268)
+        self._stock_email_groups = getattr(config, 'stock_email_groups', None) or []
+
         # Pushover 配置
         self._pushover_config = {
             'user_key': getattr(config, 'pushover_user_key', None),
@@ -157,6 +171,9 @@ class NotificationService:
 
         # PushPlus 配置
         self._pushplus_token = getattr(config, 'pushplus_token', None)
+       
+        # Server酱3 配置
+        self._serverchan3_sendkey = getattr(config, 'serverchan3_sendkey', None)
 
         # 自定义 Webhook 配置
         self._custom_webhook_urls = getattr(config, 'custom_webhook_urls', []) or []
@@ -167,6 +184,11 @@ class NotificationService:
             'bot_token': getattr(config, 'discord_bot_token', None),
             'channel_id': getattr(config, 'discord_main_channel_id', None),
             'webhook_url': getattr(config, 'discord_webhook_url', None),
+        }
+
+        self._astrbot_config = {
+            'astrbot_url': getattr(config, 'astrbot_url', None),
+            'astrbot_token': getattr(config, 'astrbot_token', None),
         }
         
         # 消息长度限制（字节）
@@ -218,6 +240,10 @@ class NotificationService:
         if self._pushplus_token:
             channels.append(NotificationChannel.PUSHPLUS)
 
+       # Server酱3
+        if self._serverchan3_sendkey:
+            channels.append(NotificationChannel.SERVERCHAN3)
+       
         # 自定义 Webhook
         if self._custom_webhook_urls:
             channels.append(NotificationChannel.CUSTOM)
@@ -225,7 +251,9 @@ class NotificationService:
         # Discord
         if self._is_discord_configured():
             channels.append(NotificationChannel.DISCORD)
-        
+        # AstrBot
+        if self._is_astrbot_configured():
+            channels.append(NotificationChannel.ASTRBOT)
         return channels
     
     def _is_telegram_configured(self) -> bool:
@@ -238,10 +266,53 @@ class NotificationService:
         bot_ok = bool(self._discord_config['bot_token'] and self._discord_config['channel_id'])
         webhook_ok = bool(self._discord_config['webhook_url'])
         return bot_ok or webhook_ok
-    
+
+    def _is_astrbot_configured(self) -> bool:
+        """检查 AstrBot 配置是否完整（支持 Bot 或 Webhook）"""
+        # 只要配置了 URL，即视为可用
+        url_ok = bool(self._astrbot_config['astrbot_url'])
+        return url_ok
+
     def _is_email_configured(self) -> bool:
         """检查邮件配置是否完整（只需邮箱和授权码）"""
         return bool(self._email_config['sender'] and self._email_config['password'])
+
+    def get_receivers_for_stocks(self, stock_codes: List[str]) -> List[str]:
+        """
+        Look up email receivers for given stock codes based on stock_email_groups.
+        Returns union of receivers for all matching groups; falls back to default if none match.
+        """
+        if not stock_codes or not self._stock_email_groups:
+            return self._email_config['receivers']
+        seen: set = set()
+        result: List[str] = []
+        for stocks, emails in self._stock_email_groups:
+            for code in stock_codes:
+                if code in stocks:
+                    for e in emails:
+                        if e not in seen:
+                            seen.add(e)
+                            result.append(e)
+                    break
+        return result if result else self._email_config['receivers']
+
+    def get_all_email_receivers(self) -> List[str]:
+        """
+        Return union of all configured email receivers (all groups + default).
+        Used for market review which should go to everyone.
+        """
+        seen: set = set()
+        result: List[str] = []
+        for _, emails in self._stock_email_groups:
+            for e in emails:
+                if e not in seen:
+                    seen.add(e)
+                    result.append(e)
+        for e in self._email_config['receivers']:
+            if e not in seen:
+                seen.add(e)
+                result.append(e)
+        return result
     
     def _is_pushover_configured(self) -> bool:
         """检查 Pushover 配置是否完整"""
@@ -346,10 +417,10 @@ class NotificationService:
             reverse=True
         )
         
-        # 统计信息
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计信息 - 使用 decision_type 字段准确统计
+        buy_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'buy')
+        sell_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'sell')
+        hold_count = sum(1 for r in results if getattr(r, 'decision_type', '') in ('hold', ''))
         avg_score = sum(r.sentiment_score for r in results) / len(results) if results else 0
         
         report_lines.extend([
@@ -379,6 +450,8 @@ class NotificationService:
                 f"**操作建议：{result.operation_advice}** | **综合评分：{result.sentiment_score}分** | **趋势预测：{result.trend_prediction}** | **置信度：{confidence_stars}**",
                 "",
             ])
+
+            self._append_market_snapshot(report_lines, result)
             
             # 核心看点
             if hasattr(result, 'key_points') and result.key_points:
@@ -504,27 +577,69 @@ class NotificationService:
         
         return "\n".join(report_lines)
     
+    @staticmethod
+    def _escape_md(name: str) -> str:
+        """Escape markdown special characters in stock names (e.g. *ST → \\*ST)."""
+        return name.replace('*', r'\*') if name else name
+
+    @staticmethod
+    def _clean_sniper_value(value: Any) -> str:
+        """Normalize sniper point values and remove redundant label prefixes."""
+        if value is None:
+            return 'N/A'
+        if isinstance(value, (int, float)):
+            return str(value)
+        if not isinstance(value, str):
+            return str(value)
+        if not value or value == 'N/A':
+            return value
+        prefixes = ['理想买入点：', '次优买入点：', '止损位：', '目标位：',
+                     '理想买入点:', '次优买入点:', '止损位:', '目标位:']
+        for prefix in prefixes:
+            if value.startswith(prefix):
+                return value[len(prefix):]
+        return value
+
     def _get_signal_level(self, result: AnalysisResult) -> tuple:
         """
-        根据操作建议获取信号等级和颜色
-        
+        Get signal level and color based on operation advice.
+
+        Priority: advice string takes precedence over score.
+        Score-based fallback is used only when advice doesn't match
+        any known value.
+
         Returns:
-            (信号文字, emoji, 颜色标记)
+            (signal_text, emoji, color_tag)
         """
         advice = result.operation_advice
         score = result.sentiment_score
-        
-        if advice in ['强烈买入'] or score >= 80:
+
+        # Advice-first lookup (exact match takes priority)
+        advice_map = {
+            '强烈买入': ('强烈买入', '💚', '强买'),
+            '买入': ('买入', '🟢', '买入'),
+            '加仓': ('买入', '🟢', '买入'),
+            '持有': ('持有', '🟡', '持有'),
+            '观望': ('观望', '⚪', '观望'),
+            '减仓': ('减仓', '🟠', '减仓'),
+            '卖出': ('卖出', '🔴', '卖出'),
+            '强烈卖出': ('卖出', '🔴', '卖出'),
+        }
+        if advice in advice_map:
+            return advice_map[advice]
+
+        # Score-based fallback when advice is unrecognized
+        if score >= 80:
             return ('强烈买入', '💚', '强买')
-        elif advice in ['买入', '加仓'] or score >= 65:
+        elif score >= 65:
             return ('买入', '🟢', '买入')
-        elif advice in ['持有'] or 55 <= score < 65:
+        elif score >= 55:
             return ('持有', '🟡', '持有')
-        elif advice in ['观望'] or 45 <= score < 55:
+        elif score >= 45:
             return ('观望', '⚪', '观望')
-        elif advice in ['减仓'] or 35 <= score < 45:
+        elif score >= 35:
             return ('减仓', '🟠', '减仓')
-        elif advice in ['卖出', '强烈卖出'] or score < 35:
+        elif score < 35:
             return ('卖出', '🔴', '卖出')
         else:
             return ('观望', '⚪', '观望')
@@ -552,10 +667,10 @@ class NotificationService:
         # 按评分排序（高分在前）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
 
-        # 统计信息
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计信息 - 使用 decision_type 字段准确统计
+        buy_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'buy')
+        sell_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'sell')
+        hold_count = sum(1 for r in results if getattr(r, 'decision_type', '') in ('hold', ''))
 
         report_lines = [
             f"# 🎯 {report_date} 决策仪表盘",
@@ -571,9 +686,10 @@ class NotificationService:
                 "",
             ])
             for r in sorted_results:
-                emoji = r.get_emoji()
+                _, signal_emoji, _ = self._get_signal_level(r)
+                display_name = self._escape_md(r.name)
                 report_lines.append(
-                    f"{emoji} **{r.name}({r.code})**: {r.operation_advice} | "
+                    f"{signal_emoji} **{display_name}({r.code})**: {r.operation_advice} | "
                     f"评分 {r.sentiment_score} | {r.trend_prediction}"
                 )
             report_lines.extend([
@@ -587,8 +703,9 @@ class NotificationService:
             signal_text, signal_emoji, signal_tag = self._get_signal_level(result)
             dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
             
-            # 股票名称（优先使用 dashboard 或 result 中的名称）
-            stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+            # 股票名称（优先使用 dashboard 或 result 中的名称，转义 *ST 等特殊字符）
+            raw_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+            stock_name = self._escape_md(raw_name)
             
             report_lines.extend([
                 f"## {signal_emoji} {stock_name} ({result.code})",
@@ -660,6 +777,8 @@ class NotificationService:
                     f"| 💼 **持仓者** | {pos_advice.get('has_position', '继续持有')} |",
                     "",
                 ])
+
+            self._append_market_snapshot(report_lines, result)
             
             # ========== 数据透视 ==========
             data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
@@ -734,10 +853,10 @@ class NotificationService:
                         "",
                         "| 点位类型 | 价格 |",
                         "|---------|------|",
-                        f"| 🎯 理想买入点 | {sniper.get('ideal_buy', 'N/A')} |",
-                        f"| 🔵 次优买入点 | {sniper.get('secondary_buy', 'N/A')} |",
-                        f"| 🛑 止损位 | {sniper.get('stop_loss', 'N/A')} |",
-                        f"| 🎊 目标位 | {sniper.get('take_profit', 'N/A')} |",
+                        f"| 🎯 理想买入点 | {self._clean_sniper_value(sniper.get('ideal_buy', 'N/A'))} |",
+                        f"| 🔵 次优买入点 | {self._clean_sniper_value(sniper.get('secondary_buy', 'N/A'))} |",
+                        f"| 🛑 止损位 | {self._clean_sniper_value(sniper.get('stop_loss', 'N/A'))} |",
+                        f"| 🎊 目标位 | {self._clean_sniper_value(sniper.get('take_profit', 'N/A'))} |",
                         "",
                     ])
                 
@@ -828,10 +947,10 @@ class NotificationService:
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
         
-        # 统计
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计 - 使用 decision_type 字段准确统计
+        buy_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'buy')
+        sell_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'sell')
+        hold_count = sum(1 for r in results if getattr(r, 'decision_type', '') in ('hold', ''))
         
         lines = [
             f"## 🎯 {report_date} 决策仪表盘",
@@ -849,6 +968,7 @@ class NotificationService:
             
             # 股票名称
             stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+            stock_name = self._escape_md(stock_name)
             
             # 标题行：信号等级 + 股票名称
             lines.append(f"### {signal_emoji} **{signal_text}** | {stock_name}({result.code})")
@@ -961,10 +1081,10 @@ class NotificationService:
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
 
-        # 统计
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计 - 使用 decision_type 字段准确统计
+        buy_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'buy')
+        sell_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'sell')
+        hold_count = sum(1 for r in results if getattr(r, 'decision_type', '') in ('hold', ''))
         avg_score = sum(r.sentiment_score for r in results) / len(results) if results else 0
 
         lines = [
@@ -1029,8 +1149,9 @@ class NotificationService:
         battle = dashboard.get('battle_plan', {}) if dashboard else {}
         intel = dashboard.get('intelligence', {}) if dashboard else {}
         
-        # 股票名称
-        stock_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+        # 股票名称（转义 *ST 等特殊字符）
+        raw_name = result.name if result.name and not result.name.startswith('股票') else f'股票{result.code}'
+        stock_name = self._escape_md(raw_name)
         
         lines = [
             f"## {signal_emoji} {stock_name} ({result.code})",
@@ -1038,6 +1159,8 @@ class NotificationService:
             f"> {report_date} | 评分: **{result.sentiment_score}** | {result.trend_prediction}",
             "",
         ]
+
+        self._append_market_snapshot(lines, result)
         
         # 核心决策（一句话）
         one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
@@ -1121,20 +1244,74 @@ class NotificationService:
         ])
         
         return "\n".join(lines)
+
+    # Display name mapping for realtime data sources
+    _SOURCE_DISPLAY_NAMES = {
+        "tencent": "腾讯财经",
+        "akshare_em": "东方财富",
+        "akshare_sina": "新浪财经",
+        "akshare_qq": "腾讯财经",
+        "efinance": "东方财富(efinance)",
+        "tushare": "Tushare Pro",
+        "sina": "新浪财经",
+        "fallback": "降级兜底",
+    }
+
+    def _append_market_snapshot(self, lines: List[str], result: AnalysisResult) -> None:
+        snapshot = getattr(result, 'market_snapshot', None)
+        if not snapshot:
+            return
+
+        lines.extend([
+            "### 📈 当日行情",
+            "",
+            "| 收盘 | 昨收 | 开盘 | 最高 | 最低 | 涨跌幅 | 涨跌额 | 振幅 | 成交量 | 成交额 |",
+            "|------|------|------|------|------|-------|-------|------|--------|--------|",
+            f"| {snapshot.get('close', 'N/A')} | {snapshot.get('prev_close', 'N/A')} | "
+            f"{snapshot.get('open', 'N/A')} | {snapshot.get('high', 'N/A')} | "
+            f"{snapshot.get('low', 'N/A')} | {snapshot.get('pct_chg', 'N/A')} | "
+            f"{snapshot.get('change_amount', 'N/A')} | {snapshot.get('amplitude', 'N/A')} | "
+            f"{snapshot.get('volume', 'N/A')} | {snapshot.get('amount', 'N/A')} |",
+        ])
+
+        if "price" in snapshot:
+            raw_source = snapshot.get('source', 'N/A')
+            display_source = self._SOURCE_DISPLAY_NAMES.get(raw_source, raw_source)
+            lines.extend([
+                "",
+                "| 当前价 | 量比 | 换手率 | 行情来源 |",
+                "|-------|------|--------|----------|",
+                f"| {snapshot.get('price', 'N/A')} | {snapshot.get('volume_ratio', 'N/A')} | "
+                f"{snapshot.get('turnover_rate', 'N/A')} | {display_source} |",
+            ])
+
+        lines.append("")
     
     def send_to_wechat(self, content: str) -> bool:
         """
         推送消息到企业微信机器人
         
         企业微信 Webhook 消息格式：
+        支持 markdown 类型以及 text 类型, markdown 类型在微信中无法展示，可以使用 text 类型,
+        markdown 类型会解析 markdown 格式,text 类型会直接发送纯文本。
+
+        markdown 类型示例：
         {
             "msgtype": "markdown",
             "markdown": {
-                "content": "Markdown 内容"
+                "content": "## 标题\n\n内容"
             }
         }
         
-        注意：企业微信 Markdown 限制 4096 字节（非字符），超长内容会自动分批发送
+        text 类型示例：
+        {
+            "msgtype": "text",
+            "text": {
+                "content": "内容"
+            }
+        }
+
+        注意：企业微信 Markdown 限制 4096 字节（非字符）, Text 类型限制 2048 字节，超长内容会自动分批发送
         可通过环境变量 WECHAT_MAX_BYTES 调整限制值
         
         Args:
@@ -1147,7 +1324,11 @@ class NotificationService:
             logger.warning("企业微信 Webhook 未配置，跳过推送")
             return False
         
-        max_bytes = self._wechat_max_bytes  # 从配置读取，默认 4000 字节
+        # 根据消息类型动态限制上限，避免 text 类型超过企业微信 2048 字节限制
+        if self._wechat_msg_type == 'text':
+            max_bytes = min(self._wechat_max_bytes, 2000)  # 预留一定字节给系统/分页标记
+        else:
+            max_bytes = self._wechat_max_bytes  # markdown 默认 4000 字节
         
         # 检查字节长度，超长则分批发送
         content_bytes = len(content.encode('utf-8'))
@@ -1208,12 +1389,13 @@ class NotificationService:
         current_chunk = []
         current_bytes = 0
         separator_bytes = get_bytes(separator)
+        effective_max_bytes = max_bytes - 50  # 预留分页标记空间，避免边界超限
         
         for section in sections:
             section_bytes = get_bytes(section) + separator_bytes
             
             # 如果单个 section 就超长，需要强制截断
-            if section_bytes > max_bytes:
+            if section_bytes > effective_max_bytes:
                 # 先发送当前积累的内容
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1221,13 +1403,13 @@ class NotificationService:
                     current_bytes = 0
                 
                 # 强制截断这个超长 section（按字节截断）
-                truncated = self._truncate_to_bytes(section, max_bytes - 200)
+                truncated = self._truncate_to_bytes(section, effective_max_bytes - 200)
                 truncated += "\n\n...(本段内容过长已截断)"
                 chunks.append(truncated)
                 continue
             
             # 检查加入后是否超长
-            if current_bytes + section_bytes > max_bytes:
+            if current_bytes + section_bytes > effective_max_bytes:
                 # 保存当前块，开始新块
                 if current_chunk:
                     chunks.append(separator.join(current_chunk))
@@ -1342,14 +1524,26 @@ class NotificationService:
                 truncated = truncated[:-1]
         return ""
     
+    def _gen_wechat_payload(self, content: str) -> dict:
+        """生成企业微信消息 payload"""
+        if self._wechat_msg_type == 'text':
+            return {
+                "msgtype": "text",
+                "text": {
+                    "content": content
+                }
+            }
+        else:
+            return {
+                "msgtype": "markdown",
+                "markdown": {
+                    "content": content
+                }
+            }
+
     def _send_wechat_message(self, content: str) -> bool:
         """发送企业微信消息"""
-        payload = {
-            "msgtype": "markdown",
-            "markdown": {
-                "content": content
-            }
-        }
+        payload = self._gen_wechat_payload(content)
         
         response = requests.post(
             self._wechat_url,
@@ -1397,7 +1591,7 @@ class NotificationService:
             return False
         
         # 飞书 lark_md 支持有限，先做格式转换
-        formatted_content = self._format_feishu_markdown(content)
+        formatted_content = format_feishu_markdown(content)
 
         max_bytes = self._feishu_max_bytes  # 从配置读取，默认 20000 字节
         
@@ -1627,81 +1821,16 @@ class NotificationService:
 
         return _post_payload(text_payload)
 
-    def _format_feishu_markdown(self, content: str) -> str:
-        """
-        将通用 Markdown 转换为飞书 lark_md 更友好的格式
-        - 飞书不支持 Markdown 标题（# / ## / ###），用加粗代替
-        - 引用块使用前缀替代
-        - 分隔线统一为细线
-        - 表格转换为条目列表
-        """
-        def _flush_table_rows(buffer: List[str], output: List[str]) -> None:
-            if not buffer:
-                return
-
-            def _parse_row(row: str) -> List[str]:
-                cells = [c.strip() for c in row.strip().strip('|').split('|')]
-                return [c for c in cells if c]
-
-            rows = []
-            for raw in buffer:
-                if re.match(r'^\s*\|?\s*[:-]+\s*(\|\s*[:-]+\s*)+\|?\s*$', raw):
-                    continue
-                parsed = _parse_row(raw)
-                if parsed:
-                    rows.append(parsed)
-
-            if not rows:
-                return
-
-            header = rows[0]
-            data_rows = rows[1:] if len(rows) > 1 else []
-            for row in data_rows:
-                pairs = []
-                for idx, cell in enumerate(row):
-                    key = header[idx] if idx < len(header) else f"列{idx + 1}"
-                    pairs.append(f"{key}：{cell}")
-                output.append(f"• {' | '.join(pairs)}")
-
-        lines = []
-        table_buffer: List[str] = []
-
-        for raw_line in content.splitlines():
-            line = raw_line.rstrip()
-
-            if line.strip().startswith('|'):
-                table_buffer.append(line)
-                continue
-
-            if table_buffer:
-                _flush_table_rows(table_buffer, lines)
-                table_buffer = []
-
-            if re.match(r'^#{1,6}\s+', line):
-                title = re.sub(r'^#{1,6}\s+', '', line).strip()
-                line = f"**{title}**" if title else ""
-            elif line.startswith('> '):
-                quote = line[2:].strip()
-                line = f"💬 {quote}" if quote else ""
-            elif line.strip() == '---':
-                line = '────────'
-            elif line.startswith('- '):
-                line = f"• {line[2:].strip()}"
-
-            lines.append(line)
-
-        if table_buffer:
-            _flush_table_rows(table_buffer, lines)
-
-        return "\n".join(lines).strip()
-    
-    def send_to_email(self, content: str, subject: Optional[str] = None) -> bool:
+    def send_to_email(
+        self, content: str, subject: Optional[str] = None, receivers: Optional[List[str]] = None
+    ) -> bool:
         """
         通过 SMTP 发送邮件（自动识别 SMTP 服务器）
         
         Args:
             content: 邮件内容（支持 Markdown，会转换为 HTML）
             subject: 邮件主题（可选，默认自动生成）
+            receivers: 收件人列表（可选，默认使用配置的 receivers）
             
         Returns:
             是否发送成功
@@ -1712,7 +1841,7 @@ class NotificationService:
         
         sender = self._email_config['sender']
         password = self._email_config['password']
-        receivers = self._email_config['receivers']
+        receivers = receivers or self._email_config['receivers']
         
         try:
             # 生成主题
@@ -1726,7 +1855,7 @@ class NotificationService:
             # 构建邮件
             msg = MIMEMultipart('alternative')
             msg['Subject'] = Header(subject, 'utf-8')
-            msg['From'] = sender
+            msg['From'] = formataddr((self._email_config.get('sender_name', '股票分析助手'), sender))
             msg['To'] = ', '.join(receivers)
             
             # 添加纯文本和 HTML 两个版本
@@ -1930,6 +2059,7 @@ class NotificationService:
         
         bot_token = self._telegram_config['bot_token']
         chat_id = self._telegram_config['chat_id']
+        message_thread_id = self._telegram_config.get('message_thread_id')
         
         try:
             # Telegram API 端点
@@ -1940,10 +2070,10 @@ class NotificationService:
             
             if len(content) <= max_length:
                 # 单条消息发送
-                return self._send_telegram_message(api_url, chat_id, content)
+                return self._send_telegram_message(api_url, chat_id, content, message_thread_id)
             else:
                 # 分段发送长消息
-                return self._send_telegram_chunked(api_url, chat_id, content, max_length)
+                return self._send_telegram_chunked(api_url, chat_id, content, max_length, message_thread_id)
                 
         except Exception as e:
             logger.error(f"发送 Telegram 消息失败: {e}")
@@ -1951,10 +2081,9 @@ class NotificationService:
             logger.debug(traceback.format_exc())
             return False
     
-    def _send_telegram_message(self, api_url: str, chat_id: str, text: str) -> bool:
-        """发送单条 Telegram 消息"""
-        # 转换 Markdown 为 Telegram 支持的格式
-        # Telegram 的 Markdown 格式稍有不同，做简单处理
+    def _send_telegram_message(self, api_url: str, chat_id: str, text: str, message_thread_id: Optional[str] = None) -> bool:
+        """Send a single Telegram message with exponential backoff retry (Fixes #287)"""
+        # Convert Markdown to Telegram-compatible format
         telegram_text = self._convert_to_telegram_markdown(text)
         
         payload = {
@@ -1963,37 +2092,75 @@ class NotificationService:
             "parse_mode": "Markdown",
             "disable_web_page_preview": True
         }
+
+        if message_thread_id:
+            payload['message_thread_id'] = message_thread_id
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.post(api_url, json=payload, timeout=10)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries:
+                    delay = 2 ** attempt  # 2s, 4s
+                    logger.warning(f"Telegram request failed (attempt {attempt}/{max_retries}): {e}, "
+                                   f"retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Telegram request failed after {max_retries} attempts: {e}")
+                    return False
         
-        response = requests.post(api_url, json=payload, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('ok'):
-                logger.info("Telegram 消息发送成功")
-                return True
-            else:
-                error_desc = result.get('description', '未知错误')
-                logger.error(f"Telegram 返回错误: {error_desc}")
-                
-                # 如果 Markdown 解析失败，尝试纯文本发送
-                if 'parse' in error_desc.lower() or 'markdown' in error_desc.lower():
-                    logger.info("尝试使用纯文本格式重新发送...")
-                    payload['parse_mode'] = None
-                    payload['text'] = text  # 使用原始文本
-                    del payload['parse_mode']
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('ok'):
+                    logger.info("Telegram 消息发送成功")
+                    return True
+                else:
+                    error_desc = result.get('description', '未知错误')
+                    logger.error(f"Telegram 返回错误: {error_desc}")
                     
-                    response = requests.post(api_url, json=payload, timeout=10)
-                    if response.status_code == 200 and response.json().get('ok'):
-                        logger.info("Telegram 消息发送成功（纯文本）")
-                        return True
-                
+                    # If Markdown parsing failed, fall back to plain text
+                    if 'parse' in error_desc.lower() or 'markdown' in error_desc.lower():
+                        logger.info("尝试使用纯文本格式重新发送...")
+                        plain_payload = dict(payload)
+                        plain_payload.pop('parse_mode', None)
+                        plain_payload['text'] = text  # Use original text
+                        
+                        try:
+                            response = requests.post(api_url, json=plain_payload, timeout=10)
+                            if response.status_code == 200 and response.json().get('ok'):
+                                logger.info("Telegram 消息发送成功（纯文本）")
+                                return True
+                        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                            logger.error(f"Telegram plain-text fallback failed: {e}")
+                    
+                    return False
+            elif response.status_code == 429:
+                # Rate limited — respect Retry-After header
+                retry_after = int(response.headers.get('Retry-After', 2 ** attempt))
+                if attempt < max_retries:
+                    logger.warning(f"Telegram rate limited, retrying in {retry_after}s "
+                                   f"(attempt {attempt}/{max_retries})...")
+                    time.sleep(retry_after)
+                    continue
+                else:
+                    logger.error(f"Telegram rate limited after {max_retries} attempts")
+                    return False
+            else:
+                if attempt < max_retries and response.status_code >= 500:
+                    delay = 2 ** attempt
+                    logger.warning(f"Telegram server error HTTP {response.status_code} "
+                                   f"(attempt {attempt}/{max_retries}), retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                logger.error(f"Telegram 请求失败: HTTP {response.status_code}")
+                logger.error(f"响应内容: {response.text}")
                 return False
-        else:
-            logger.error(f"Telegram 请求失败: HTTP {response.status_code}")
-            logger.error(f"响应内容: {response.text}")
-            return False
+
+        return False
     
-    def _send_telegram_chunked(self, api_url: str, chat_id: str, content: str, max_length: int) -> bool:
+    def _send_telegram_chunked(self, api_url: str, chat_id: str, content: str, max_length: int, message_thread_id: Optional[str] = None) -> bool:
         """分段发送长 Telegram 消息"""
         # 按段落分割
         sections = content.split("\n---\n")
@@ -2011,7 +2178,7 @@ class NotificationService:
                 if current_chunk:
                     chunk_content = "\n---\n".join(current_chunk)
                     logger.info(f"发送 Telegram 消息块 {chunk_index}...")
-                    if not self._send_telegram_message(api_url, chat_id, chunk_content):
+                    if not self._send_telegram_message(api_url, chat_id, chunk_content, message_thread_id):
                         all_success = False
                     chunk_index += 1
                 
@@ -2025,10 +2192,10 @@ class NotificationService:
         # 发送最后一块
         if current_chunk:
             chunk_content = "\n---\n".join(current_chunk)
-            logger.info(f"发送 Telegram 消息块 {chunk_index}（最后）...")
-            if not self._send_telegram_message(api_url, chat_id, chunk_content):
+            logger.info(f"发送 Telegram 消息块 {chunk_index}...")
+            if not self._send_telegram_message(api_url, chat_id, chunk_content, message_thread_id):
                 all_success = False
-        
+                
         return all_success
     
     def _convert_to_telegram_markdown(self, text: str) -> str:
@@ -2707,6 +2874,84 @@ class NotificationService:
             logger.error(f"发送 PushPlus 消息失败: {e}")
             return False
 
+    def send_to_serverchan3(self, content: str, title: Optional[str] = None) -> bool:
+        """
+        推送消息到 Server酱3
+
+        Server酱3 API 格式：
+        POST https://sctapi.ftqq.com/{sendkey}.send
+        或
+        POST https://{num}.push.ft07.com/send/{sendkey}.send
+        {
+            "title": "消息标题",
+            "desp": "消息内容",
+            "options": {}
+        }
+
+        Server酱3 特点：
+        - 国内推送服务，支持多家国产系统推送通道，可无后台推送
+        - 简单易用的 API 接口
+
+        Args:
+            content: 消息内容（Markdown 格式）
+            title: 消息标题（可选）
+
+        Returns:
+            是否发送成功
+        """
+        if not self._serverchan3_sendkey:
+            logger.warning("Server酱3 SendKey 未配置，跳过推送")
+            return False
+
+        # 处理消息标题
+        if title is None:
+            date_str = datetime.now().strftime('%Y-%m-%d')
+            title = f"📈 股票分析报告 - {date_str}"
+
+        try:
+            # 根据 sendkey 格式构造 URL
+            sendkey = self._serverchan3_sendkey
+            if sendkey.startswith('sctp'):
+                match = re.match(r'sctp(\d+)t', sendkey)
+                if match:
+                    num = match.group(1)
+                    url = f"https://{num}.push.ft07.com/send/{sendkey}.send"
+                else:
+                    logger.error("Invalid sendkey format for sctp")
+                    return False
+            else:
+                url = f"https://sctapi.ftqq.com/{sendkey}.send"
+
+            # 构建请求参数
+            params = {
+                'title': title,
+                'desp': content,
+                'options': {}
+            }
+
+            # 发送请求
+            headers = {
+                'Content-Type': 'application/json;charset=utf-8'
+            }
+            response = requests.post(url, json=params, headers=headers, timeout=10)
+
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"Server酱3 消息发送成功: {result}")
+                return True
+            else:
+                logger.error(f"Server酱3 请求失败: HTTP {response.status_code}")
+                logger.error(f"响应内容: {response.text}")
+                return False
+
+        except Exception as e:
+            logger.error(f"发送 Server酱3 消息失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+
+
+   
     def send_to_discord(self, content: str) -> bool:
         """
         推送消息到 Discord（支持 Webhook 和 Bot API）
@@ -2726,6 +2971,23 @@ class NotificationService:
             return self._send_discord_bot(content)
         
         logger.warning("Discord 配置不完整，跳过推送")
+        return False
+
+
+    def send_to_astrbot(self, content: str) -> bool:
+        """
+        推送消息到 AstrBot（通过适配器支持）
+
+        Args:
+            content: Markdown 格式的消息内容
+
+        Returns:
+            是否发送成功
+        """
+        if self._astrbot_config['astrbot_url']:
+            return self._send_astrbot(content)
+
+        logger.warning("AstrBot 配置不完整，跳过推送")
         return False
     
     def _send_discord_webhook(self, content: str) -> bool:
@@ -2795,8 +3057,60 @@ class NotificationService:
         except Exception as e:
             logger.error(f"Discord Bot 发送异常: {e}")
             return False
+
+    def _send_astrbot(self, content: str) -> bool:
+        import time
+        """
+        使用 Bot API 发送消息到 AstrBot
+
+        Args:
+            content: Markdown 格式的消息内容
+
+        Returns:
+            是否发送成功
+        """
+
+        html_content = self._markdown_to_html(content)
+
+        try:
+            payload = {
+                'content': html_content
+            }
+            signature =  ""
+            timestamp = str(int(time.time()))
+            if self._astrbot_config['astrbot_token']:
+                """计算请求签名"""
+                payload_json = json.dumps(payload, sort_keys=True)
+                sign_data = f"{timestamp}.{payload_json}".encode('utf-8')
+                key = self._astrbot_config['astrbot_token']
+                signature = hmac.new(
+                    key.encode('utf-8'),
+                    sign_data,
+                    hashlib.sha256
+                ).hexdigest()
+            url = self._astrbot_config['astrbot_url']
+            response = requests.post(url, json=payload, timeout=10,headers={
+                        "Content-Type": "application/json",
+                        "X-Signature": signature,
+                        "X-Timestamp": timestamp
+                    })
+
+            if response.status_code == 200:
+                logger.info("AstrBot 消息发送成功")
+                return True
+            else:
+                logger.error(f"AstrBot 发送失败: {response.status_code} {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"AstrBot 发送异常: {e}")
+            return False
     
-    def send(self, content: str) -> bool:
+    def send(
+        self,
+        content: str,
+        email_stock_codes: Optional[List[str]] = None,
+        email_send_to_all: bool = False
+    ) -> bool:
         """
         统一发送接口 - 向所有已配置的渠道发送
         
@@ -2804,6 +3118,8 @@ class NotificationService:
         
         Args:
             content: 消息内容（Markdown 格式）
+            email_stock_codes: 股票代码列表（可选，用于邮件渠道路由到对应分组邮箱，Issue #268）
+            email_send_to_all: 邮件是否发往所有配置邮箱（用于大盘复盘等无股票归属的内容）
             
         Returns:
             是否至少有一个渠道发送成功
@@ -2833,15 +3149,24 @@ class NotificationService:
                 elif channel == NotificationChannel.TELEGRAM:
                     result = self.send_to_telegram(content)
                 elif channel == NotificationChannel.EMAIL:
-                    result = self.send_to_email(content)
+                    receivers = None
+                    if email_send_to_all and self._stock_email_groups:
+                        receivers = self.get_all_email_receivers()
+                    elif email_stock_codes and self._stock_email_groups:
+                        receivers = self.get_receivers_for_stocks(email_stock_codes)
+                    result = self.send_to_email(content, receivers=receivers)
                 elif channel == NotificationChannel.PUSHOVER:
                     result = self.send_to_pushover(content)
                 elif channel == NotificationChannel.PUSHPLUS:
                     result = self.send_to_pushplus(content)
+                elif channel == NotificationChannel.SERVERCHAN3:
+                    result = self.send_to_serverchan3(content)
                 elif channel == NotificationChannel.CUSTOM:
                     result = self.send_to_custom(content)
                 elif channel == NotificationChannel.DISCORD:
                     result = self.send_to_discord(content)
+                elif channel == NotificationChannel.ASTRBOT:
+                    result = self.send_to_astrbot(content)
                 else:
                     logger.warning(f"不支持的通知渠道: {channel}")
                     result = False
